@@ -15,6 +15,8 @@ uint16_t client_hello_length = 0;
 uint8_t server_hello_buf[SERVER_HELLO_SIZE];
 uint16_t server_hello_length = 0;
 
+#define MAX_SEND 943
+
 // flags
 int8_t client_hello_sent = 0;
 int8_t client_hello_recvd = 0;
@@ -31,17 +33,17 @@ char host_name[256] = "";
 void init_sec(int type, char* host) {
     init_io();
     host_type = type;
-    
+
     if (host != NULL)
         memcpy(host_name, host, strlen(host) + 1);
 
     fprintf(stderr, "Type = %d, Hostname: %s\n", host_type, host_name);
-    
+
 }
 
 // Transport layers call this when making packets!
 ssize_t input_sec(uint8_t* buf, size_t max_length) {
-    
+
     // CLIENT: client hello
     if (host_type == CLIENT && !client_hello_sent) {
 
@@ -77,10 +79,10 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
 
         return len;
     }
-    
+
     // CLIENT: client finished
     else if (host_type == CLIENT && !client_finished_sent) {
-        
+
         fprintf(stderr, "Finished Client sent!\n");
 
         tlv* finished_msg_tlv = create_tlv(FINISHED);
@@ -99,7 +101,7 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         uint16_t len = 0;
 
         fprintf(stderr, "Transcript Length: %d\n", transcript_len);
-        
+
         hmac(hmac_buf, transcript_buf, transcript_len);
 
         tlv* transcript_tlv = create_tlv(TRANSCRIPT);
@@ -121,11 +123,11 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
 
     // SERVER: server hello
     if (host_type == SERVER && client_hello_recvd && !server_hello_sent) {
-        
+
         fprintf(stderr, "\nServer Creating TLV!\n");
-        
+
         tlv* sh = create_tlv(SERVER_HELLO);
-        
+
         // 1. Generate a nonce
         tlv* nn = create_tlv(NONCE);
         uint8_t nonce[NONCE_SIZE];
@@ -138,13 +140,21 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         load_certificate("server_cert.bin");
         tlv* cert = create_tlv(CERTIFICATE);
         add_val(cert, certificate, cert_size);
-        add_tlv(sh, cert);   
+        add_tlv(sh, cert);
 
-        // 3. Generate a public / private key: Ephemeral - one time use
-        load_private_key("server_key.bin");
+        // 3. Generate a public key: Ephemeral
+        generate_private_key();
+        derive_public_key();
+        EVP_PKEY* ephemeral_priv_key = get_private_key();
+        EVP_PKEY* ephemeral_pub_key = public_key;
+
         tlv* pk = create_tlv(PUBLIC_KEY);
         add_val(pk, public_key, pub_key_size);
         add_tlv(sh, pk);
+
+        // Load in private key for handshake signature
+        load_private_key("server_key.bin");
+
 
         // 4. Create hand-shake signature
         uint8_t signature_buf[1024];
@@ -163,11 +173,13 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         uint8_t signature[72]; // max length 72 bytes
         int32_t signature_len = 0;
 
-        signature_len = sign(signature, signature_buf, signature_buf_len);  
-        
+        signature_len = sign(signature, signature_buf, signature_buf_len);
+
+        set_private_key(ephemeral_priv_key);
+
         tlv* sig = create_tlv(HANDSHAKE_SIGNATURE);
         add_val(sig, signature, signature_len);
-        add_tlv(sh, sig);   
+        add_tlv(sh, sig);
 
         uint16_t len = serialize_tlv(buf, sh);
         free_tlv(sh);
@@ -176,7 +188,7 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         memcpy(server_hello_buf, buf, len);
         server_hello_length = len;
         server_hello_sent = 1;
-    
+
         //6. Derive shared secret
 
         tlv* client_public_key = get_tlv(ch, PUBLIC_KEY);
@@ -185,7 +197,7 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
 
         uint8_t salt_buf[2048];
         uint16_t salt_buf_len = 0;
-        
+
         tlv* ch_tmp = deserialize_tlv(client_hello_buf, client_hello_length);
         tlv* sh_tmp = deserialize_tlv(server_hello_buf, server_hello_length);
 
@@ -198,19 +210,70 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         return len;
     }
 
-    return input_io(buf, max_length);
+    // Post-Handshake: Encrypt & Send
+    tlv* data_packet = create_tlv(DATA);
+
+    // Read in 943 bytes
+    uint8_t data_buff[MAX_SEND];
+    uint16_t nread = input_io(data_buff, MAX_SEND);
+
+    uint8_t iv_buff[IV_SIZE];
+    uint8_t ciphertxt_buff[MAX_SEND];
+
+    // Encrypt data read
+    size_t ciphertxt_len = encrypt_data(iv_buff, ciphertxt_buff, data_buff, nread);
+
+    // Create and add IV packet
+    tlv* iv_tlv = create_tlv(IV);
+    add_val(iv_tlv, iv_buff, IV_SIZE);
+    add_tlv(data_packet, iv_tlv);
+
+    //Create and add Ciphertext packet
+    tlv* ciphertext_tlv = create_tlv(CIPHERTEXT);
+    add_val(ciphertext_tlv, ciphertxt_buff, ciphertxt_len);
+    add_tlv(data_packet, ciphertext_tlv);
+
+    // Create HMAC digest
+    uint8_t hmac_buf[32];
+
+    uint8_t digest_buf[2048];
+    uint16_t digest_len = 0;
+
+    digest_len += serialize_tlv(digest_buf + digest_len, iv_tlv);
+    digest_len += serialize_tlv(digest_buf + digest_len, ciphertext_tlv);
+
+    fprintf(stderr, "Transcript Length: %d\n", digest_len);
+
+    hmac(hmac_buf, digest_buf, digest_len);
+
+    uint16_t len = 0;
+
+
+    // Create MAC
+    tlv* mac_tlv = create_tlv(MAC);
+    add_val(mac_tlv, hmac_buf, 32);
+    add_tlv(data_packet, mac_tlv);
+
+    // Send and clean up
+    len = serialize_tlv(buf, data_packet);
+
+    free_tlv(iv_tlv);
+    free_tlv(ciphertext_tlv);
+    free_tlv(mac_tlv);
+
+    return len;
 }
 
 // Each time Transport layer receives in-order packet it will call this
 void output_sec(uint8_t* buf, size_t length) {
-    
+
     tlv* sh = deserialize_tlv(buf, length);
 
     if (sh != NULL) {
 
         // CLIENT: client finish - receive server hello
         if (host_type == CLIENT && client_hello_sent && !server_hello_recvd) {
-            
+
             fprintf(stderr, "SERVER HELLO RECEIVED \n");
 
             // 1. Verify CA Certificate
@@ -222,21 +285,21 @@ void output_sec(uint8_t* buf, size_t length) {
 
             tlv* dns = get_tlv(cert, DNS_NAME);
             tlv* ca_pk = get_tlv(cert, PUBLIC_KEY);
-            
+
             tlv* ca_sig = get_tlv(cert, SIGNATURE);
 
-            // signature ! 
+            // signature !
             uint8_t certificate_buffer[1024];
             uint16_t certificate_buffer_len = 0;
 
             certificate_buffer_len += serialize_tlv(certificate_buffer + certificate_buffer_len, dns);
             certificate_buffer_len += serialize_tlv(certificate_buffer + certificate_buffer_len, ca_pk);
 
-            
+
             if (verify(ca_sig->val, ca_sig->length, certificate_buffer, certificate_buffer_len, ec_ca_public_key) == 1) {
                 fprintf(stderr, "WERE SO BACK - VERIFIED THE CERTIFICATE\n");
             }
-            else 
+            else
             {
                 fprintf(stderr, "Uh oh\n\n\n");
                 exit(1);
@@ -248,7 +311,7 @@ void output_sec(uint8_t* buf, size_t length) {
             if (strcmp(host_name, (char*)dns->val) == 0) {
                 fprintf(stderr, "WERE SO BACK - VERIFIED DNS NAME\n");
             }
-            else 
+            else
             {
                 fprintf(stderr, "Uh oh\n\n\n");
                 exit(2);
@@ -257,7 +320,7 @@ void output_sec(uint8_t* buf, size_t length) {
             // 3. Verifiy the server hello was signed by the server
             tlv* sig = get_tlv(sh, HANDSHAKE_SIGNATURE);
 
-            fprintf(stderr, "Printing signature type\n");
+            fprintf(stderr, "Printing signature type: ");
             fprintf(stderr, "0x%x\n", sig->type);
 
             // use cached client hello
@@ -265,22 +328,22 @@ void output_sec(uint8_t* buf, size_t length) {
             tlv* nn_sig = get_tlv(sh, NONCE);
             tlv* cert_sig = get_tlv(sh, CERTIFICATE);
             tlv* pk_sig = get_tlv(sh, PUBLIC_KEY);
-           
-            if (ch_sig == NULL) 
+
+            if (ch_sig == NULL)
                 fprintf(stderr, "FRICK ch_sig is NULL!\n");
-            if (nn_sig == NULL) 
+            if (nn_sig == NULL)
                 fprintf(stderr, "FRICK nn_sig is NULL!\n");
 
             uint8_t signature_buffer[1024];
             uint16_t signature_buffer_len = 0;
-            
+
             fprintf(stderr, "Got here! Client hello: 0x%x\n", ch_sig->type);
 
             signature_buffer_len += serialize_tlv(signature_buffer + signature_buffer_len, ch_sig);
             signature_buffer_len += serialize_tlv(signature_buffer + signature_buffer_len, nn_sig);
             signature_buffer_len += serialize_tlv(signature_buffer + signature_buffer_len, cert_sig);
             signature_buffer_len += serialize_tlv(signature_buffer + signature_buffer_len, pk_sig);
-           
+
             fprintf(stderr, "Got here! Post Serialize\n");
 
             tlv* cert_pub_key = get_tlv(cert_sig, PUBLIC_KEY);
@@ -292,12 +355,12 @@ void output_sec(uint8_t* buf, size_t length) {
             if (verify(sig->val, sig->length, signature_buffer, signature_buffer_len, ec_peer_public_key) == 1) {
                 fprintf(stderr, "WERE SO BACK - VERIFIED HANDSHAKE SIGNATURE!\n");
             }
-            else 
+            else
             {
                 fprintf(stderr, "Uh oh - CLIENT FAILED TO VERIFY HANDSHAKE SIGNATURE FRICKED UP\n\n\n");
                 exit(3);
             }
-        
+
             // 4. cache the server hello
             memcpy(server_hello_buf, buf, length);
             server_hello_length = length;
@@ -312,7 +375,7 @@ void output_sec(uint8_t* buf, size_t length) {
 
             uint8_t salt_buf[2048];
             uint16_t salt_buf_len = 0;
-            
+
             tlv* ch_tmp = deserialize_tlv(client_hello_buf, client_hello_length);
             tlv* sh_tmp = deserialize_tlv(server_hello_buf, server_hello_length);
 
@@ -322,7 +385,7 @@ void output_sec(uint8_t* buf, size_t length) {
             fprintf(stderr, "DERIVED SHARED KEYS!\n");
             derive_keys(salt_buf, salt_buf_len);
         }
-    
+
         // SERVER: cache client hello
         if (host_type == SERVER && !client_hello_recvd) {
             fprintf(stderr, "CLIENT HELLO RECEIVED\n");
@@ -330,32 +393,32 @@ void output_sec(uint8_t* buf, size_t length) {
             if (sh->type != CLIENT_HELLO) {
                 fprintf(stderr, "Received non-client hello!");
                 exit(6);
-            } 
-            
+            }
+
             // buffer client_hello for signature
             memcpy(client_hello_buf, buf, length);
             client_hello_length = length;
 
             client_hello_recvd = 1;
         }
-        
+
         // SERVER: verify transcripts
         else if (host_type == SERVER && client_hello_recvd && !client_finished_recvd) {
 
             // 1. Verifiy client finish transcript
             tlv* ch_tmp = deserialize_tlv(client_hello_buf, client_hello_length);
             tlv* sh_tmp = deserialize_tlv(server_hello_buf, server_hello_length);
-    
+
             uint8_t transcript_buf[2048];
             uint8_t hmac_buf[32];
-    
+
             uint16_t transcript_len = 0;
-    
+
             transcript_len += serialize_tlv(transcript_buf + transcript_len, ch_tmp);
             transcript_len += serialize_tlv(transcript_buf + transcript_len, sh_tmp);
-        
+
             fprintf(stderr, "Transcript Length: %d\n", transcript_len);
-            
+
             hmac(hmac_buf, transcript_buf, transcript_len);
             fprintf(stderr, "hmac calculated: %s\n", hmac_buf);
             fprintf(stderr, "hmac length: %d\n", 32);
@@ -365,20 +428,57 @@ void output_sec(uint8_t* buf, size_t length) {
             fprintf(stderr, "Transcript hmac: %s\n", trans->val);
             fprintf(stderr, "Transcript hmac length: %d\n", trans->length);
 
-            // if (strcmp(hmac_buf, (uint8_t *)trans->val) == 0) {
-            //     fprintf(stderr, "Transcript verified");
-            // }
-            // else {
-            //     fprintf(stderr, "KMS\n");
+            if (memcmp(hmac_buf, trans->val, trans->length) == 0) {
+                fprintf(stderr, "Transcript verified\n");
+            }
+            else {
+                fprintf(stderr, "Transcript doesn't match\n");
+                exit(4);
+            }
 
-            // }
-    
             client_finished_recvd = 1;
         }
-    
-        
-        output_io(buf, length);
-    }
- 
 
+        //Post-Handshake: Decrypt and Output
+        else if(client_finished_recvd || client_finished_sent){
+            fprintf(stderr, "Normally receiving data now\n");
+
+
+            //Verify MAC: Compute own hmac and compare with received
+            tlv* received_iv_tlv = get_tlv(sh, IV);
+            tlv* received_ciphertxt_tlv = get_tlv(sh, CIPHERTEXT);
+
+            uint8_t hmac_buf[32];
+
+            uint8_t digest_buf[2048];
+            uint16_t digest_len = 0;
+
+            digest_len += serialize_tlv(digest_buf + digest_len, received_iv_tlv);
+            digest_len += serialize_tlv(digest_buf + digest_len, received_ciphertxt_tlv);
+
+            hmac(hmac_buf, digest_buf, digest_len);
+
+            tlv* received_mac_tlv = get_tlv(sh, MAC);
+
+            // Computed MAC and received MAC does not match
+            if (memcmp(hmac_buf, received_mac_tlv->val,
+                received_mac_tlv->length) != 0) {
+                fprintf(stderr, "hmac calculated: %s\n", hmac_buf);
+                fprintf(stderr, "hmac received: %s\n", received_mac_tlv->val);
+
+                fprintf(stderr, "Mac do not match\n");
+
+                exit(5);
+            }
+            uint8_t data_buff[MAX_SEND];
+
+            // Decrypt Cipher
+            size_t decrypt_len = decrypt_cipher(data_buff,
+                                                received_ciphertxt_tlv->val,
+                                                received_ciphertxt_tlv->length,
+                                                received_iv_tlv->val);
+
+            output_io(data_buff, decrypt_len);
+        }
+    }
 }
